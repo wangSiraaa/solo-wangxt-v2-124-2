@@ -1,0 +1,140 @@
+<div class="cv-layout">
+  <div class="cv-left">
+    <div class="panel">
+      <h2>1. 选择核对案例 / 加载试验</h2>
+      <label>合成案例</label>
+      <select [(ngModel)]="demoCase">
+        <option value="linear_elastic">A · 纯线弹性（无屈服交点）</option>
+        <option value="no_clear_yield">B · 无清晰屈服（连续过渡）</option>
+        <option value="clear_yield">C · 明确屈服 + 颈缩（参考案例）</option>
+      </select>
+      <label>
+        <input type="checkbox" [(ngModel)]="omitDiameter" style="width:auto">
+        尺寸缺失案例（省略初始直径 d0，分析应被拒绝）
+      </label>
+      <button (click)="loadDemo()" [disabled]="loading">加载案例</button>
+    </div>
+
+    <div class="panel" *ngIf="run">
+      <h2>2. 计算方案</h2>
+      <div class="muted">试样：{{ run.specimen_code }} · {{ run.channels.length }} 个独立通道</div>
+      <div class="muted">
+        通道：<span *ngFor="let c of run.channels"><br>· {{ c.kind }} ({{ c.unit }}, {{ c.point_count }} 点)</span>
+      </div>
+      <label>应变来源（夹具位移与引伸计不可混列）</label>
+      <select [(ngModel)]="strainSource">
+        <option value="extensometer"
+          *ngIf="run.raw_values['extensometer_displacement']">引伸计（材料应变，优先）</option>
+        <option value="crosshead"
+          *ngIf="run.raw_values['crosshead_displacement']">夹具位移（含机器柔度，仅近似）</option>
+      </select>
+      <label>应力单位</label>
+      <select [(ngModel)]="stressUnit">
+        <option>MPa</option><option>GPa</option><option>Pa</option>
+      </select>
+
+      <h2 style="margin-top:14px">3. 弹性区间</h2>
+      <div class="muted">在右侧图上横向框选弹性段；区间影响随拟合一并给出。</div>
+      <div class="row2">
+        <div><label>ε 下限 (mm/mm)</label>
+          <input type="number" step="0.0001" [(ngModel)]="strainMin"></div>
+        <div><label>ε 上限 (mm/mm)</label>
+          <input type="number" step="0.0001" [(ngModel)]="strainMax"></div>
+      </div>
+
+      <h2 style="margin-top:14px">人工排除点</h2>
+      <div class="muted" *ngIf="pendingExcludeIndex !== null">
+        待排除点索引 #{{ pendingExcludeIndex }} —— 必须填写原因：
+        <input [(ngModel)]="excludeReason" placeholder="例如：载荷毛刺，单点突增 25%">
+        <button (click)="confirmExclude()">确认排除</button>
+        <button class="secondary" (click)="cancelExclude()">取消</button>
+      </div>
+      <div class="muted" *ngIf="pendingExcludeIndex === null">
+        单击工程应力曲线上的点可登记排除（原因必填）。
+      </div>
+      <table *ngIf="excluded.length">
+        <tr><th>索引</th><th>原因</th><th></th></tr>
+        <tr *ngFor="let p of excluded; let i = index">
+          <td>#{{ p.index }}</td><td style="text-align:left">{{ p.reason }}</td>
+          <td><button class="secondary" (click)="removeExcluded(i)">撤销</button></td>
+        </tr>
+      </table>
+
+      <button (click)="analyze()" [disabled]="loading || strainMin === null || strainMax === null">
+        SciPy 拟合 / 计算
+      </button>
+      <button class="secondary" (click)="generateReport()" [disabled]="loading">生成溯源报告</button>
+      <div class="error" *ngIf="error">{{ error }}</div>
+    </div>
+
+    <div class="panel" *ngIf="result">
+      <h2>计算结果</h2>
+      <div class="metric"><span>弹性模量 E</span>
+        <b>{{ result.elastic_fit.modulus_in_output_unit | number:'1.4-4' }}
+          {{ result.elastic_fit.modulus_unit }}</b></div>
+      <div class="metric"><span>拟合 R² / 点数</span>
+        <b>{{ result.elastic_fit.r_squared | number:'1.6-6' }} /
+          {{ result.elastic_fit.n_points }}（排除 {{ result.elastic_fit.n_excluded }}）</b></div>
+      <div class="metric"><span>0.2% 偏移法（ε₀=0.002 mm/mm）</span>
+        <ng-container *ngIf="result.yield_result.found">
+          <b>Rp0.2 = {{ result.yield_result.proof_stress | number:'1.4-4' }}
+            {{ result.yield_result.stress_unit }}</b>
+        </ng-container>
+        <b *ngIf="!result.yield_result.found" class="badge bad">未确定</b>
+      </div>
+      <div *ngIf="result.yield_result.found">
+        <span class="badge" [class.warn]="result.yield_result.yield_unclear">
+          {{ result.yield_result.yield_unclear ? '无明显屈服平台 · 仅条件屈服值' : '屈服明确' }}
+        </span>
+        <div class="muted">{{ result.yield_result.reason }}</div>
+      </div>
+      <div *ngIf="!result.yield_result.found" class="warn">{{ result.yield_result.reason }}</div>
+
+      <div class="metric" style="margin-top:8px"><span>抗拉强度 Rm</span>
+        <b>{{ result.fracture.ultimate_tensile_strength | number:'1.4-4' }}
+          {{ result.fracture.stress_unit }}</b></div>
+      <div class="metric"><span>断后伸长率 A</span>
+        <b [class.muted]="result.fracture.elongation_percent === null">
+          {{ result.fracture.elongation_percent !== null ?
+            (result.fracture.elongation_percent | number:'1.2-2') + ' %'
+            : '未计算（缺断后标距 Lu）' }}
+        </b></div>
+      <div class="metric"><span>断面收缩率 Z</span>
+        <b [class.muted]="result.fracture.reduction_of_area_percent === null">
+          {{ result.fracture.reduction_of_area_percent !== null ?
+            (result.fracture.reduction_of_area_percent | number:'1.2-2') + ' %'
+            : '未计算（缺断后直径 du）' }}
+        </b></div>
+      <div class="warn" *ngFor="let m of result.fracture.missing_inputs">· {{ m }}</div>
+
+      <h2 style="margin-top:14px">区间影响</h2>
+      <table>
+        <tr><th>区间</th><th>ε 下限</th><th>ε 上限</th><th>E</th><th>R²</th><th>点数</th></tr>
+        <tr *ngFor="let s of result.interval_sensitivity">
+          <td>{{ s.label }}</td>
+          <td>{{ s.strain_min | number:'1.5-5' }}</td>
+          <td>{{ s.strain_max | number:'1.5-5' }}</td>
+          <td>{{ s.modulus_in_output_unit | number:'1.4-4' }}</td>
+          <td>{{ s.r_squared | number:'1.5-5' }}</td>
+          <td>{{ s.n_points }}</td>
+        </tr>
+      </table>
+
+      <div class="warn" *ngFor="let w of result.warnings" style="margin-top:8px">⚠ {{ w }}</div>
+    </div>
+
+    <div class="panel" *ngIf="report">
+      <h2>{{ report.title }}</h2>
+      <pre class="report">{{ report.markdown }}</pre>
+    </div>
+  </div>
+
+  <div class="cv-right">
+    <div class="panel">
+      <div #plot id="plot"></div>
+    </div>
+    <div class="panel">
+      <div #residualPlot id="residual-plot"></div>
+    </div>
+  </div>
+</div>
