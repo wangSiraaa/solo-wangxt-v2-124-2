@@ -4,7 +4,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---- 试样与试验 ----
@@ -79,6 +79,33 @@ class ExcludedPoint(BaseModel):
     reason: str = Field(..., min_length=1, description="人工排除原因，不允许空")
 
 
+class MachineCompliance(BaseModel):
+    """机器柔度校准参数（可选）：按 δ_machine = F·C 逐点扣除。
+
+    系数与单位必须同时提供；单位缺失的系数无法解释，按 422 拒绝。
+    """
+    coefficient: float = Field(..., gt=0, description="机器柔度校准系数（>0）")
+    unit: Literal["m/N", "mm/N", "mm/kN"] = Field(
+        ..., description="校准单位，必须与校准证书一致")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_coefficient_and_unit(cls, data: object) -> object:
+        if isinstance(data, dict):
+            coef = data.get("coefficient")
+            unit = data.get("unit")
+            if coef is None:
+                raise ValueError(
+                    "启用机器柔度修正必须提供柔度系数（machine_compliance.coefficient）"
+                )
+            if unit is None or str(unit).strip() == "":
+                raise ValueError(
+                    "启用机器柔度修正必须提供校准单位（m/N、mm/N 或 mm/kN）："
+                    "缺少单位的系数无法解释，拒绝保存可能错误的修正结果"
+                )
+        return data
+
+
 class FitRequest(BaseModel):
     run_id: int
     strain_source: Literal["extensometer", "crosshead"] | None = None
@@ -87,6 +114,8 @@ class FitRequest(BaseModel):
     strain_min: float | None = None
     strain_max: float | None = None
     excluded_points: list[ExcludedPoint] = Field(default_factory=list)
+    # 可选机器柔度修正：仅对夹具位移应变有效；None = 关闭修正
+    machine_compliance: MachineCompliance | None = None
 
 
 class ResidualPoint(BaseModel):
@@ -153,6 +182,26 @@ class CurvePoint(BaseModel):
     true_stress_valid: bool
     load_n: float
     source: str
+    # 机器柔度修正逐点信息（仅修正曲线上的点存在）
+    corrected: bool = False
+    physically_valid: bool = Field(
+        default=True,
+        description="修正后该点是否物理合理（负修正位移/回退为 False），False 点不参与拟合")
+    invalid_reason: str | None = None
+    machine_deformation_m: float | None = Field(
+        default=None, description="该点被扣除的机器变形 F·C（m）")
+
+
+class ComplianceCorrectionInfo(BaseModel):
+    """本次分析实际使用的柔度校准与修正情况。"""
+    coefficient: float
+    unit: str
+    coefficient_si_m_per_n: float
+    correction_formula: str
+    n_nonphysical_points: int
+    nonphysical_indices: list[int]
+    nonphysical_reasons: list[str] = Field(
+        description="每个非物理点的原因（与 nonphysical_indices 对应）")
 
 
 class AnalysisResult(BaseModel):
@@ -167,6 +216,12 @@ class AnalysisResult(BaseModel):
     necking_index: int | None
     warnings: list[str]
     provenance: dict
+    # 机器柔度修正
+    compliance_correction: ComplianceCorrectionInfo | None = Field(
+        default=None, description="启用修正时的校准参数与非物理点情况；关闭时为 null")
+    reference_curve: list[CurvePoint] | None = Field(
+        default=None,
+        description="修正前的原始夹具位移曲线（未修正、未截断），仅供对照显示；原始信号不变")
 
 
 class ReportOut(BaseModel):

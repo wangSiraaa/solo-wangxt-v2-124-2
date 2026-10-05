@@ -7,7 +7,8 @@ import Plotly from 'plotly.js-dist-min';
 
 import { ApiService } from '../api.service';
 import {
-  AnalysisResult, ExcludedPoint, FitRequest, Report, RunDetail,
+  AnalysisResult, ComplianceUnit, DemoCreated, ExcludedPoint, FitRequest,
+  MachineCompliance, Report, RunDetail,
 } from '../models';
 
 type DemoCase = 'linear_elastic' | 'no_clear_yield' | 'clear_yield';
@@ -36,6 +37,12 @@ export class CurveViewerComponent implements AfterViewInit, OnDestroy {
   excluded: ExcludedPoint[] = [];
   excludeReason = '';
   pendingExcludeIndex: number | null = null;
+
+  // 机器柔度修正（可选；仅夹具位移应变可用）
+  complianceEnabled = false;
+  complianceCoefficient: number | null = null;
+  complianceUnit: ComplianceUnit = 'mm/kN';
+  readonly complianceUnits: ComplianceUnit[] = ['m/N', 'mm/N', 'mm/kN'];
 
   loading = false;
   error = '';
@@ -69,6 +76,13 @@ export class CurveViewerComponent implements AfterViewInit, OnDestroy {
     el.on('plotly_click', (event: PlotlyClick) => {
       const p = event?.points?.[0];
       if (p && p.curveNumber === 0) {
+        const point = this.result?.curve[p.pointNumber];
+        if (point && point.physically_valid === false) {
+          this.error = `索引 #${point.index} 是柔度修正后的非物理点（${point.invalid_reason ?? '原因未知'}），`
+            + '已被系统标记且不参与拟合；如确认数据无误可人工排除，但必须填写原因';
+          return;
+        }
+        this.error = '';
         this.pendingExcludeIndex = p.pointNumber;
       }
     });
@@ -88,19 +102,38 @@ export class CurveViewerComponent implements AfterViewInit, OnDestroy {
     this.report = null;
     this.excluded = [];
     this.api.createDemo(this.demoCase, this.omitDiameter).subscribe({
-      next: (d) => {
+      next: (d: DemoCreated) => {
         this.api.getRun(d.run_id).subscribe((run) => {
           this.run = run;
           this.strainSource = run.calc_plan.strain_source as 'extensometer' | 'crosshead';
           this.stressUnit = run.calc_plan.stress_unit;
           this.strainMin = null;
           this.strainMax = null;
+          // 预填合成案例随数据提供的校准值（实验员仍可改成自己的证书值）
+          if (d.machine_compliance) {
+            this.complianceCoefficient = d.machine_compliance.coefficient;
+            this.complianceUnit = d.machine_compliance.unit;
+          } else {
+            this.complianceCoefficient = null;
+          }
+          this.complianceEnabled = false;
           this.loading = false;
           this.drawRawCurve();
         });
       },
       error: (e) => { this.error = e.message; this.loading = false; },
     });
+  }
+
+  onStrainSourceChange(): void {
+    // 柔度修正只对夹具位移有物理意义；切到引伸计时自动关闭修正
+    if (this.strainSource !== 'crosshead') {
+      this.complianceEnabled = false;
+    }
+  }
+
+  get complianceApplicable(): boolean {
+    return this.strainSource === 'crosshead';
   }
 
   confirmExclude(): void {
@@ -129,6 +162,16 @@ export class CurveViewerComponent implements AfterViewInit, OnDestroy {
     this.drawRawCurve();
   }
 
+  private buildCompliance(): MachineCompliance | null {
+    if (!this.complianceEnabled || this.strainSource !== 'crosshead') {
+      return null;
+    }
+    return {
+      coefficient: Number(this.complianceCoefficient),
+      unit: this.complianceUnit,
+    };
+  }
+
   private buildRequest(): FitRequest {
     return {
       run_id: this.run!.run_id,
@@ -137,11 +180,34 @@ export class CurveViewerComponent implements AfterViewInit, OnDestroy {
       strain_min: this.strainMin,
       strain_max: this.strainMax,
       excluded_points: this.excluded,
+      machine_compliance: this.buildCompliance(),
     };
+  }
+
+  private validateCompliance(): string | null {
+    if (!this.complianceEnabled || this.strainSource !== 'crosshead') {
+      return null;
+    }
+    const c = Number(this.complianceCoefficient);
+    if (this.complianceCoefficient === null || Number.isNaN(c)) {
+      return '已启用机器柔度修正，但未填写柔度系数：请输入校准值，或取消勾选以关闭修正';
+    }
+    if (c <= 0) {
+      return `柔度系数必须为正（收到 ${this.complianceCoefficient}），请核对校准证书`;
+    }
+    if (!this.complianceUnit) {
+      return '已启用机器柔度修正，但未选择校准单位（m/N、mm/N 或 mm/kN）：缺少单位的系数无法解释';
+    }
+    return null;
   }
 
   analyze(): void {
     this.error = '';
+    const complianceError = this.validateCompliance();
+    if (complianceError) {
+      this.error = complianceError;
+      return;
+    }
     this.loading = true;
     this.report = null;
     this.api.analyze(this.buildRequest()).subscribe({
@@ -160,6 +226,11 @@ export class CurveViewerComponent implements AfterViewInit, OnDestroy {
 
   generateReport(): void {
     if (!this.run) { return; }
+    const complianceError = this.validateCompliance();
+    if (complianceError) {
+      this.error = complianceError;
+      return;
+    }
     this.loading = true;
     this.api.report(this.run.run_id, this.buildRequest()).subscribe({
       next: (r) => { this.report = r; this.loading = false; },
@@ -199,13 +270,23 @@ export class CurveViewerComponent implements AfterViewInit, OnDestroy {
   private drawResult(r: AnalysisResult): void {
     const pts = r.curve;
     const excludedSet = new Set(r.elastic_fit.excluded.map((p) => p.index));
-    const engX = pts.map((p) => p.strain);
+    const isCorrected = r.compliance_correction !== null;
+    // 修正曲线上非物理点（负修正位移/回退）：断开显示，不参与拟合
+    const nonphysicalSet = new Set(
+      pts.filter((p) => p.physically_valid === false).map((p) => p.index));
+    const engX = pts.map((p) =>
+      (nonphysicalSet.has(p.index) || excludedSet.has(p.index)) ? null : p.strain);
     const engY = pts.map((p) =>
-      excludedSet.has(p.index) ? null : p.engineering_stress);
-    const trueX = pts.filter((p) => p.true_stress_valid).map((p) => p.strain);
-    const trueY = pts.filter((p) => p.true_stress_valid).map((p) => p.true_stress);
+      (nonphysicalSet.has(p.index) || excludedSet.has(p.index)) ? null : p.engineering_stress);
+    const truePts = pts.filter(
+      (p) => p.true_stress_valid && p.physically_valid !== false);
+    const trueX = truePts.map((p) => p.strain);
+    const trueY = truePts.map((p) => p.true_stress);
     const exclX = pts.filter((p) => excludedSet.has(p.index)).map((p) => p.strain);
     const exclY = pts.filter((p) => excludedSet.has(p.index)).map((p) => p.engineering_stress);
+    const npPts = pts.filter((p) => nonphysicalSet.has(p.index));
+    const npX = npPts.map((p) => p.strain);
+    const npY = npPts.map((p) => p.engineering_stress);
 
     // 拟合直线 + 0.2% 偏移线（应变单位 mm/mm，显式 0.002）
     const fit = r.elastic_fit;
@@ -238,7 +319,7 @@ export class CurveViewerComponent implements AfterViewInit, OnDestroy {
         y0: 0, y1: 1, line: { color: '#16a34a', dash: 'dash', width: 1 },
       });
     }
-    if (r.necking_index !== null) {
+    if (r.necking_index !== null && pts[r.necking_index]) {
       shapes.push({
         type: 'line', xref: 'x', yref: 'paper',
         x0: pts[r.necking_index].strain, x1: pts[r.necking_index].strain,
@@ -246,21 +327,43 @@ export class CurveViewerComponent implements AfterViewInit, OnDestroy {
       });
     }
 
-    Plotly.react(this.plotEl.nativeElement, [
-      { x: engX, y: engY, mode: 'lines', name: '工程应力-应变',
-        line: { color: '#2563eb' } },
+    const traces: Record<string, unknown>[] = [
+      { x: engX, y: engY, mode: 'lines',
+        name: isCorrected ? '工程应力-应变（柔度修正后）' : '工程应力-应变',
+        line: { color: '#2563eb', width: 2 } },
+    ];
+    // 未修正的原始夹具位移对照曲线：修正启用时同时显示，明示“原始信号未改动”
+    if (isCorrected && r.reference_curve) {
+      traces.push({
+        x: r.reference_curve.map((p) => p.strain),
+        y: r.reference_curve.map((p) => p.engineering_stress),
+        mode: 'lines', name: '原始夹具位移曲线（未修正，仅对照）',
+        line: { color: '#9ca3af', dash: 'dot', width: 1.5 },
+        opacity: 0.9,
+      });
+    }
+    traces.push(
       { x: trueX, y: trueY, mode: 'lines', name: '真实应力（颈缩后不换算）',
         line: { color: '#7c3aed' } },
+      { x: npX, y: npY, mode: 'markers',
+        name: `修正后非物理点（${nonphysicalSet.size}，不参与拟合）`,
+        marker: { color: '#dc2626', size: 10, symbol: 'star-triangle-down' } },
       { x: exclX, y: exclY, mode: 'markers', name: '人工排除点（有原因）',
-        marker: { color: '#dc2626', size: 8, symbol: 'x' } },
+        marker: { color: '#f59e0b', size: 8, symbol: 'x' } },
       fitLine, offsetLine,
-    ], {
-      title: `应力-应变（应变来源：${r.strain_source_used}）— 红竖线颈缩起点`,
+    );
+
+    const titleMode = isCorrected
+      ? `（柔度修正后：C=${r.compliance_correction!.coefficient} ${r.compliance_correction!.unit}）`
+      : `（应变来源：${r.strain_source_used}）`;
+    Plotly.react(this.plotEl.nativeElement, traces, {
+      title: `应力-应变 ${titleMode} — 红竖线颈缩起点`,
       xaxis: { title: '工程应变 ε (mm/mm)' },
       yaxis: { title: `应力 (${r.stress_unit})` },
       shapes,
       dragmode: 'select',
       selectdirection: 'h',
+      hovermode: 'closest',
     }, { responsive: true, displaylogo: false });
 
     // 残差图：弹性区内逐点残差，让用户看到区间是否合适

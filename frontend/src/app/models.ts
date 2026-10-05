@@ -3,6 +3,13 @@ export interface ExcludedPoint {
   reason: string;
 }
 
+export type ComplianceUnit = 'm/N' | 'mm/N' | 'mm/kN';
+
+export interface MachineCompliance {
+  coefficient: number;
+  unit: ComplianceUnit;
+}
+
 export interface FitRequest {
   run_id: number;
   strain_source?: 'extensometer' | 'crosshead';
@@ -10,6 +17,7 @@ export interface FitRequest {
   strain_min: number | null;
   strain_max: number | null;
   excluded_points: ExcludedPoint[];
+  machine_compliance?: MachineCompliance | null;
 }
 
 export interface FitResult {
@@ -70,6 +78,20 @@ export interface CurvePoint {
   true_stress_valid: boolean;
   load_n: number;
   source: string;
+  corrected?: boolean;
+  physically_valid?: boolean;
+  invalid_reason?: string | null;
+  machine_deformation_m?: number | null;
+}
+
+export interface ComplianceCorrectionInfo {
+  coefficient: number;
+  unit: string;
+  coefficient_si_m_per_n: number;
+  correction_formula: string;
+  n_nonphysical_points: number;
+  nonphysical_indices: number[];
+  nonphysical_reasons: string[];
 }
 
 export interface AnalysisResult {
@@ -84,6 +106,8 @@ export interface AnalysisResult {
   necking_index: number | null;
   warnings: string[];
   provenance: Record<string, unknown>;
+  compliance_correction: ComplianceCorrectionInfo | null;
+  reference_curve: CurvePoint[] | null;
 }
 
 export interface RunDetail {
@@ -93,6 +117,19 @@ export interface RunDetail {
   calc_plan: { strain_source: string; stress_unit: string };
   channels: { kind: string; unit: string; point_count: number }[];
   raw_values: Record<string, number[]>;
+}
+
+export interface DemoCreated {
+  run_id: number;
+  specimen_id: number;
+  case: string;
+  points: number;
+  diameter_omitted: boolean;
+  machine_compliance?: {
+    coefficient: number;
+    unit: ComplianceUnit;
+    coefficient_si_m_per_n: number;
+  };
 }
 
 export interface Report {

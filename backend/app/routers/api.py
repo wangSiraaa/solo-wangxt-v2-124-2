@@ -1,6 +1,8 @@
 """HTTP 路由。"""
 from __future__ import annotations
 
+import math
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -8,11 +10,13 @@ from sqlalchemy.orm import Session
 from .. import services
 from ..database import get_db
 from ..mechanics.analysis import run_analysis
+from ..mechanics.compliance import parse_compliance
 from ..mechanics.report import render_markdown
 from ..mechanics.synthetic import (
     case_clear_yield,
     case_linear_elastic,
     case_no_clear_yield,
+    synthetic_machine_compliance,
 )
 from ..models import Analysis, RawSignal, Report, Specimen, TestRun
 from ..schemas import (
@@ -117,6 +121,14 @@ def _do_analysis(db: Session, req: FitRequest) -> tuple[Analysis, AnalysisResult
     if run is None:
         raise HTTPException(404, "试验记录不存在")
     try:
+        # 校准参数校验：系数/单位不成对或单位未知时直接给出中文原因，不保存伪结果
+        try:
+            compliance = parse_compliance(
+                req.machine_compliance.coefficient if req.machine_compliance else None,
+                req.machine_compliance.unit if req.machine_compliance else None,
+            )
+        except ValueError as exc:
+            raise CurveError(str(exc)) from exc
         channels, info = services.channels_from_run(run)
         result = run_analysis(
             channels=channels,
@@ -127,9 +139,10 @@ def _do_analysis(db: Session, req: FitRequest) -> tuple[Analysis, AnalysisResult
             strain_max=req.strain_max,
             excluded=req.excluded_points,
             run_id=run.id,
+            machine_compliance=compliance,
         )
     except CurveError as exc:
-        #尺寸缺失、通道缺失、区间点数不足等：明确 422 与原因，不返回伪造数值
+        #尺寸缺失、通道缺失、区间点数不足、柔度非物理等：明确 422 与原因，不返回伪造数值
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     params = {
@@ -138,6 +151,8 @@ def _do_analysis(db: Session, req: FitRequest) -> tuple[Analysis, AnalysisResult
         "strain_min": req.strain_min,
         "strain_max": req.strain_max,
         "excluded_points": [p.model_dump() for p in req.excluded_points],
+        "machine_compliance": (req.machine_compliance.model_dump()
+                               if req.machine_compliance is not None else None),
     }
     analysis = services.persist_analysis(db, run.id, params, result.model_dump(mode="json"))
     return analysis, result
@@ -178,6 +193,19 @@ def get_analysis(analysis_id: int, db: Session = Depends(get_db)) -> dict:
             "result": a.result, "is_latest": a.is_latest}
 
 
+@router.get("/runs/{run_id}/analyses")
+def list_run_analyses(run_id: int, db: Session = Depends(get_db)) -> dict:
+    """列出某次试验的全部分析记录（用于核对被拒绝的分析确实未入库）。"""
+    run = services.get_run_or_none(db, run_id)
+    if run is None:
+        raise HTTPException(404, "试验记录不存在")
+    rows = db.scalars(
+        select(Analysis).where(Analysis.run_id == run_id).order_by(Analysis.id)
+    ).all()
+    return {"run_id": run_id, "count": len(rows),
+            "analysis_ids": [a.id for a in rows]}
+
+
 @router.get("/reports/{report_id}")
 def get_report(report_id: int, db: Session = Depends(get_db)) -> dict:
     r = db.get(Report, report_id)
@@ -205,6 +233,8 @@ def demo_synthetic(case_name: str, with_final_measurements: bool = True,
     if case_name not in generators:
         raise HTTPException(404, f"未知案例 {case_name}")
     run_data = generators[case_name]()
+    area_m2 = math.pi * (10.0e-3) ** 2 / 4
+    c_si, c_mm_kn, c_unit = synthetic_machine_compliance(area_m2)
 
     g = dict(geometry="round",
              nominal_diameter_mm=None if omit_diameter else 10.0,
@@ -225,7 +255,10 @@ def demo_synthetic(case_name: str, with_final_measurements: bool = True,
     run = TestRun(
         specimen_id=s.id,
         equipment={"machine": "SYNTHETIC", "load_cell_capacity_n": 100000,
-                   "extensometer_gauge_length_mm": 50.0, "sampling_rate_hz": 100},
+                   "extensometer_gauge_length_mm": 50.0, "sampling_rate_hz": 100,
+                   # 校准得到的机器柔度（合成案例随数据提供）
+                   "machine_compliance_coefficient": c_mm_kn,
+                   "machine_compliance_unit": c_unit},
         calc_plan={"strain_source": "extensometer", "stress_unit": "MPa"},
     )
     db.add(run)
@@ -240,4 +273,8 @@ def demo_synthetic(case_name: str, with_final_measurements: bool = True,
                          si_values=services.convert_channel_to_si(kind, vals, unit)))
     db.commit()
     return {"run_id": run.id, "specimen_id": s.id, "case": case_name,
-            "points": run_data.n, "diameter_omitted": omit_diameter}
+            "points": run_data.n, "diameter_omitted": omit_diameter,
+            "machine_compliance": {
+                "coefficient": c_mm_kn, "unit": c_unit,
+                "coefficient_si_m_per_n": c_si,
+            }}

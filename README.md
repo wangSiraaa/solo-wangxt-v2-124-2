@@ -18,7 +18,9 @@ Angular + Plotly.js 界面上展示工程/真实应力-应变曲线、弹性拟�
 | 无清晰屈服案例 | 交点附近局部刚度/E > 0.6 时 `yield_unclear=true`，界面标注“仅条件屈服值” |
 | 尺寸缺失案例 | 缺 d0/b0/t0 直接 422 并给出中文原因；缺断后尺寸时 A/Z 为 null 并列入 `missing_inputs` |
 | 原始信号保留 | 分析与排除只写入 `analyses.params`（排除点**必须带 reason**，空原因被 Pydantic 拒绝），`raw_signals.values/si_values` 永不回写 |
-| 报告不能只有孤立数值 | `mechanics/report.py` 输出方法、区间、点数、R²/残差、区间敏感性、单位、缺失输入、颈缩规则、完整 provenance |
+| 机器柔度修正（可选） | 应变来源选夹具位移时可填入校准系数 C 与**显式单位**（`m/N` / `mm/N` / `mm/kN`），按 `δ_corr[i] = δ_cross[i] − F[i]·C` 逐点扣除，生成**独立的修正应变曲线**参与拟合、0.2% 屈服、Rm/A/Z 与报告；原始夹具/引伸计信号不动，未修正曲线同时作为对照返回（`mechanics/compliance.py`、`curves.build_corrected_curve`） |
+| 修正非物理点保护 | 修正后相对位移为负（过修正）或较上一有效点回退（载荷毛刺）逐点标记 `physically_valid=false` 与原因；落在弹性区间内即 422 **拒绝拟合**、不入库；缺少校准单位/单位未知同样 422 并给出中文原因 |
+| 报告不能只有孤立数值 | `mechanics/report.py` 输出方法、区间、点数、R²/残差、区间敏感性、单位、缺失输入、颈缩规则、完整 provenance（含柔度校准值/单位/公式/非物理点） |
 
 ## 三个核对案例（信号空间合成，全链路可复算）
 
@@ -30,7 +32,9 @@ Angular + Plotly.js 界面上展示工程/真实应力-应变曲线、弹性拟�
   期望：Rp0.2≈403 MPa、A=16%、Z=64%，颈缩后真实应力缺失。
 
 夹具位移信号额外注入机器柔度位移，因此用它算模量会系统性偏低
-（实测 200 GPa → ~91 GPa），用于证明两个通道不能混用。
+（实测 200 GPa → ~91 GPa），用于证明两个通道不能混用；合成案例同时返回
+注入柔度的校准值（C = 1.2·Lc/(A0·200 GPa)，约 0.00611 mm/kN），在界面勾选
+“启用机器柔度修正”并填入该值后，模量恢复为 200 GPa——即柔度修正的验收案例。
 
 ## 运行
 
@@ -62,29 +66,34 @@ docker compose up --build
 
 ```bash
 cd backend && ../.venv/bin/python -m pytest -q
-# 13 passed：8 个计算内核 + 5 个端到端 API（含 422 与原始信号不可变校验）
+# 27 passed：17 个计算内核（含柔度修正恢复 E、单位换算、关闭修正复原、
+# 非物理点标记与阻止、缺单位拒绝）+ 10 个端到端 API（含 422、原始信号不可变、
+# 被拒绝分析不入库的校验）
 ```
 
 ## 界面操作
 
 1. 左侧选择案例（可勾选“尺寸缺失”）→ **加载案例**；
-2. 选择应变来源与应力单位；
+2. 选择应变来源与应力单位；夹具位移时可勾选**启用机器柔度修正**并填入
+   校准系数与单位（合成案例自动预填注入值，实测案例填校准证书值）；
 3. 在曲线上**横向框选**弹性区间（或手填 ε 上下限）；
 4. **单击曲线点**可人工排除，必须填写原因；
 5. **SciPy 拟合/计算**后查看 E、残差图、区间影响表、Rp0.2（绿色偏移线）、
-   颈缩竖线及真实曲线缺口；
+   颈缩竖线及真实曲线缺口；启用修正时蓝线为修正曲线、灰色点线为未修正对照，
+   红色星形为修正后非物理点（不参与拟合）；
 6. **生成溯源报告**得到完整 Markdown 并入库（`reports` 表）。
 
 ## 目录
 
 ```
 backend/app/
-  mechanics/curves.py       # 通道分离、工程/真实曲线、颈缩判定
-  mechanics/elasticity.py   # OLS 模量、残差、区间敏感性
-  mechanics/yield_.py       # 0.2% 偏移法（含无交点/无清晰屈服）
+  mechanics/compliance.py  # 机器柔度校准单位与逐点扣除、非物理点标记
+  mechanics/curves.py       # 通道分离、工程/真实曲线、颈缩判定、修正/对照曲线
+  mechanics/elasticity.py   # OLS 模量、残差、区间敏感性（阻止非物理点入拟合）
+  mechanics/yield_.py       # 0.2% 偏移法（含无交点/无清晰屈服/非物理点断开）
   mechanics/fracture.py     # Rm、A、Z 与缺失输入
-  mechanics/synthetic.py    # 三个合成案例（载荷-位移空间）
-  mechanics/report.py       # 溯源 Markdown
+  mechanics/synthetic.py    # 三个合成案例（载荷-位移空间，附注入柔度校准值）
+  mechanics/report.py       # 溯源 Markdown（含柔度修正章节）
   routers/api.py            # FastAPI 路由
   models.py                 # SQLAlchemy（PG JSONB / SQLite JSON）
 frontend/src/app/           # Angular standalone + Plotly.js

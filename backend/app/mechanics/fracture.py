@@ -15,9 +15,21 @@ from ..units import stress_from_pa, StressUnit
 def fracture_metrics(curve: StressStrainCurve, specimen: SpecimenInfo,
                      stress_unit: str = "MPa") -> FractureResult:
     stress_unit_enum = StressUnit(stress_unit)
-    uts_idx = curve.uts_index
+    valid = curve.valid_mask()
+    stress_series = curve.engineering_stress
+    strain_series = curve.strain
+    # 修正曲线：非物理点（负修正位移/回退）不参与 Rm 与断裂应变
+    if curve.point_valid is not None:
+        stress_series = np.where(valid, curve.engineering_stress, -np.inf)
+    uts_idx = int(np.argmax(stress_series))
     uts_pa = float(curve.engineering_stress[uts_idx])
-    fracture_strain = float(curve.strain[-1]) if curve.strain[-1] > 0 else None
+    valid_idx = np.where(valid)[0]
+    last_valid = int(valid_idx[-1])
+    last_strain = float(curve.strain[last_valid])
+    fracture_strain = last_strain if last_strain > 0 else None
+    if curve.point_valid is not None and last_valid < len(curve.strain) - 1:
+        # 末端存在被截断的非物理点：记录到 provenance 之外不额外造数
+        fracture_strain = last_strain if last_strain > 0 else None
 
     missing: list[str] = []
     elongation_pct = None

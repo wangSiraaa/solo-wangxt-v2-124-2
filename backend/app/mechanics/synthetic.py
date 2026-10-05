@@ -17,21 +17,48 @@ class SyntheticRun:
     crosshead_m: np.ndarray
     extensometer_m: np.ndarray
     n: int
+    # 注入到夹具位移的机器柔度校准值（m/N）；修正时使用同一值即可恢复材料应变
+    compliance_m_per_n: float = 0.0
+
+
+# 合成机器刚度基准（机器柔度位移 = F/A0/K_machine * compliance_factor * Lc）
+SYNTHETIC_MACHINE_MODULUS_PA = 2.0e11
+DEFAULT_COMPLIANCE_FACTOR = 1.2
+
+
+def synthetic_machine_compliance(area_m2: float, lc_mm: float = 80.0,
+                                 factor: float = DEFAULT_COMPLIANCE_FACTOR
+                                 ) -> tuple[float, float, str]:
+    """返回合成注入柔度的校准值：(m/N, mm/kN 值, mm/kN 单位字符串)。
+
+    机器柔度位移 δ_m = F/(A0·K_machine)·factor·Lc，
+    因此 C = factor·Lc/(A0·K_machine)（m/N）。
+    """
+    lc = lc_mm * 1e-3
+    c_m_per_n = factor * lc / (area_m2 * SYNTHETIC_MACHINE_MODULUS_PA)
+    # 1 m/N = 1e6 mm/kN
+    c_mm_per_kn = c_m_per_n * 1e6
+    return c_m_per_n, c_mm_per_kn, "mm/kN"
 
 
 def _signals_from_strain(strain: np.ndarray, stress_pa: np.ndarray,
                          area_m2: float, le_m: float, lc_m: float,
-                         compliance: float = 1.2) -> SyntheticRun:
+                         compliance: float = DEFAULT_COMPLIANCE_FACTOR
+                         ) -> SyntheticRun:
     """由目标材料应变/应力反推三通道信号。
 
-    夹具位移额外包含机器柔度位移 F*compliance_factor，
-    因此夹具位移通道与引伸计通道必然不同——用于检验二者不可混列。
+    夹具位移额外包含机器柔度位移 F·C，其中
+    C = compliance·Lc/(A0·K_machine)（m/N），
+    因此夹具位移通道与引伸计通道必然不同——用于检验二者不可混列；
+    使用同一 C 逐点扣除即可恢复材料应变（合成层面的校准验收）。
     """
     load = stress_pa * area_m2
     ext_disp = strain * le_m
-    cross_disp = strain * lc_m + load / (area_m2 * 2e11) * compliance * lc_m
+    c_m_per_n = compliance * lc_m / (area_m2 * SYNTHETIC_MACHINE_MODULUS_PA)
+    cross_disp = strain * lc_m + load * c_m_per_n
     return SyntheticRun(load_n=load, crosshead_m=cross_disp,
-                        extensometer_m=ext_disp, n=len(strain))
+                        extensometer_m=ext_disp, n=len(strain),
+                        compliance_m_per_n=c_m_per_n)
 
 
 def case_linear_elastic(E_pa: float = 200e9, d0_mm: float = 10.0,

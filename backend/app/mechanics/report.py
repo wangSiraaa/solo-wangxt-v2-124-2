@@ -22,6 +22,15 @@ def render_markdown(result: AnalysisResult, specimen_code: str,
     lines.append(f"- 应变来源：**{prov['strain_source']}**（{prov['strain_basis']}）")
     lines.append(f"- 初始截面积 A0 = {prov['initial_area_m2']:.6e} m²")
     lines.append(f"- 应力输出单位：{result.stress_unit}")
+    mc = prov.get("machine_compliance_correction") or {}
+    if mc.get("enabled"):
+        lines.append(
+            f"- 机器柔度修正：**已启用**，C = {mc['coefficient']:g} {mc['unit']}"
+            f"（= {mc['coefficient_si_m_per_n']:.6g} m/N），"
+            "按 δ_corr[i] = δ_crosshead[i] − F[i]·C 逐点扣除"
+        )
+    else:
+        lines.append("- 机器柔度修正：未启用（夹具位移含机器变形，模量可能系统性偏低）")
     lines.append("")
 
     lines.append("## 1. 弹性模量 E")
@@ -48,6 +57,27 @@ def render_markdown(result: AnalysisResult, specimen_code: str,
             f"R² = {s.r_squared:.6f}，点数 {s.n_points}"
         )
     lines.append("")
+
+    if result.compliance_correction is not None:
+        cc = result.compliance_correction
+        lines.append("## 1b. 机器柔度修正（夹具位移）")
+        lines.append(f"- 校准值：C = **{cc.coefficient:g} {cc.unit}**"
+                     f"（SI：{cc.coefficient_si_m_per_n:.6g} m/N）")
+        lines.append(f"- 逐点修正公式：{cc.correction_formula}")
+        lines.append("- 修正只作用于分析副本：原始夹具位移、引伸计信号均未回写；"
+                     "未修正曲线作为对照同时保留")
+        if cc.n_nonphysical_points:
+            lines.append(
+                f"- ⚠ 修正后非物理点 {cc.n_nonphysical_points} 个"
+                "（负修正位移或修正位移回退），已标记且不参与拟合："
+            )
+            for idx, reason in zip(cc.nonphysical_indices, cc.nonphysical_reasons):
+                lines.append(f"  - 索引 #{idx}：{reason}")
+        else:
+            lines.append("- 逐点检查：全部采样点修正后位移为正且单调，无非物理点")
+        lines.append("- 以下弹性拟合、0.2% 偏移屈服与强度指标均基于**修正后曲线**；"
+                     "对照曲线可在界面上与原始曲线同时查看")
+        lines.append("")
 
     lines.append("## 2. 屈服强度（0.2% 偏移法）")
     lines.append("- 偏移线 σ = E·(ε − 0.002)，应变单位 mm/mm（0.2% 为无量纲 0.002）")

@@ -30,6 +30,24 @@ def _first_intersection(strain: np.ndarray, stress: np.ndarray,
     return None
 
 
+def _first_intersection_valid(strain: np.ndarray, stress: np.ndarray,
+                              valid: np.ndarray | None,
+                              slope: float, intercept: float,
+                              search_from: int) -> tuple[float, float] | None:
+    """寻找首个自上方穿越点；非物理点使曲线断开，绝不跨间隙插值。"""
+    diff = stress - (slope * strain + intercept)
+    for i in range(search_from, len(diff) - 1):
+        if valid is not None and not (valid[i] and valid[i + 1]):
+            continue
+        if diff[i] >= 0.0 > diff[i + 1]:
+            f0, f1 = diff[i], diff[i + 1]
+            t = -f0 / (f1 - f0)
+            eps = strain[i] + t * (strain[i + 1] - strain[i])
+            sig = slope * eps + intercept
+            return float(sig), float(eps)
+    return None
+
+
 def proof_stress_offset(curve: StressStrainCurve, fit: FitResult,
                         stress_unit: str = "MPa",
                         offset: float = OFFSET_YIELD_STRAIN) -> YieldResult:
@@ -37,18 +55,23 @@ def proof_stress_offset(curve: StressStrainCurve, fit: FitResult,
     E = fit.slope_pa
     # 弹性拟合上限之后寻找交点（初段噪声不可能产生真实屈服交点）
     search_from = max(0, int(np.searchsorted(curve.strain, fit.strain_max, side="left")) - 1)
-    hit = _first_intersection(
-        curve.strain[search_from:], curve.engineering_stress[search_from:],
-        E, -E * offset,
+    # 柔度修正后的非物理点不参与屈服判定：曲线在这些点断开，绝不跨间隙插值
+    hit = _first_intersection_valid(
+        curve.strain, curve.engineering_stress, curve.point_valid,
+        E, -E * offset, search_from,
     )
+    # 无交点原因判定使用最后一个物理有效点
+    valid = curve.valid_mask()
+    last_valid = int(np.where(valid)[0][-1])
     if hit is None:
         diff_end = float(
-            curve.engineering_stress[-1] - E * (curve.strain[-1] - offset)
+            curve.engineering_stress[last_valid]
+            - E * (curve.strain[last_valid] - offset)
         )
         if diff_end >= 0:
             reason = (
                 "工程应力-应变曲线在整个记录范围内始终位于 0.2% 偏移线上方，"
-                f"二者无交点（末点应变 {curve.strain[-1]:.4f}）："
+                f"二者无交点（末有效点应变 {curve.strain[last_valid]:.4f}）："
                 "材料保持线弹性或在出现塑性流动前终止，0.2% 偏移法无法给出条件屈服强度"
             )
         else:
@@ -60,13 +83,16 @@ def proof_stress_offset(curve: StressStrainCurve, fit: FitResult,
             yield_unclear=False,
         )
 
-    _, sig_pa, eps = hit
+    sig_pa, eps = hit
 
     # “无清晰屈服”判定：交点附近割线模量仍较高（连续过渡、无屈服平台）。
-    # 交点前后窗口局部刚度 / E > 0.6 视为无明显屈服。
+    # 交点前后窗口局部刚度 / E > 0.6 视为无明显屈服；只取连续物理有效点。
     i0 = int(np.searchsorted(curve.strain, eps, side="left"))
-    win = slice(max(0, i0 - 3), min(len(curve.strain), i0 + 4))
-    xs, ys = curve.strain[win], curve.engineering_stress[win]
+    lo, hi = max(0, i0 - 3), min(len(curve.strain), i0 + 4)
+    win_idx = np.array(
+        [i for i in range(lo, hi) if valid[i]], dtype=int
+    )
+    xs, ys = curve.strain[win_idx], curve.engineering_stress[win_idx]
     unclear = False
     if len(xs) >= 3:
         local_slope = np.polyfit(xs, ys, 1)[0]

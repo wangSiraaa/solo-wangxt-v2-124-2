@@ -2,15 +2,15 @@ import { Injectable } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { Observable } from 'rxjs';
 
-import { AnalysisResult, FitRequest, Report, RunDetail } from './models';
+import { AnalysisResult, DemoCreated, FitRequest, Report, RunDetail } from './models';
 
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   constructor(private http: HttpClient) {}
 
-  createDemo(caseName: string, omitDiameter = false): Observable<{ run_id: number }> {
+  createDemo(caseName: string, omitDiameter = false): Observable<DemoCreated> {
     const q = omitDiameter ? '?omit_diameter=true' : '';
-    return this.http.post<{ run_id: number }>(
+    return this.http.post<DemoCreated>(
       `/api/demo/synthetic/${caseName}${q}`, {});
   }
 

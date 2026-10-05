@@ -22,7 +22,7 @@
         通道：<span *ngFor="let c of run.channels"><br>· {{ c.kind }} ({{ c.unit }}, {{ c.point_count }} 点)</span>
       </div>
       <label>应变来源（夹具位移与引伸计不可混列）</label>
-      <select [(ngModel)]="strainSource">
+      <select [(ngModel)]="strainSource" (ngModelChange)="onStrainSourceChange()">
         <option value="extensometer"
           *ngIf="run.raw_values['extensometer_displacement']">引伸计（材料应变，优先）</option>
         <option value="crosshead"
@@ -32,6 +32,33 @@
       <select [(ngModel)]="stressUnit">
         <option>MPa</option><option>GPa</option><option>Pa</option>
       </select>
+
+      <div class="compliance-box">
+        <label style="font-weight:600">
+          <input type="checkbox" [(ngModel)]="complianceEnabled"
+                 [disabled]="!complianceApplicable" style="width:auto">
+          启用机器柔度修正（按载荷逐点扣除机器变形 F·C）
+        </label>
+        <div class="muted" *ngIf="!complianceApplicable">
+          柔度修正只对夹具位移通道有效（机器变形叠加在该通道）；引伸计读数不含机器变形。
+        </div>
+        <div *ngIf="complianceApplicable && complianceEnabled">
+          <div class="row2">
+            <div><label>柔度系数 C（校准值）</label>
+              <input type="number" step="any" [(ngModel)]="complianceCoefficient"
+                     placeholder="例如 0.00611"></div>
+            <div><label>校准单位（必填）</label>
+              <select [(ngModel)]="complianceUnit">
+                <option *ngFor="let u of complianceUnits" [value]="u">{{ u }}</option>
+              </select></div>
+          </div>
+          <div class="muted">
+            逐点修正：δ_corrected[i] = δ_crosshead[i] − F[i]·C，
+            修正后应变 ε = (δ_corrected − δ_corrected[0]) / Lc。
+            修正只生成独立曲线，原始夹具位移与引伸计信号不会改动。
+          </div>
+        </div>
+      </div>
 
       <h2 style="margin-top:14px">3. 弹性区间</h2>
       <div class="muted">在右侧图上横向框选弹性段；区间影响随拟合一并给出。</div>
@@ -69,6 +96,19 @@
 
     <div class="panel" *ngIf="result">
       <h2>计算结果</h2>
+      <div class="metric" *ngIf="result.compliance_correction as cc"><span>机器柔度修正</span>
+        <b>C = {{ cc.coefficient | number:'1.6-6' }} {{ cc.unit }}
+          （{{ cc.coefficient_si_m_per_n | number:'1.3-3' }} m/N）</b>
+      </div>
+      <div class="muted" *ngIf="result.compliance_correction as cc">{{ cc.correction_formula }}</div>
+      <div class="metric" *ngIf="result.compliance_correction as cc"><span>非物理点（负修正位移/回退）</span>
+        <b [class.bad]="cc.n_nonphysical_points > 0">{{ cc.n_nonphysical_points }} 个</b>
+      </div>
+      <ng-container *ngIf="result.compliance_correction as cc">
+        <div class="warn" *ngFor="let reason of cc.nonphysical_reasons">
+          ⚠ {{ reason }}
+        </div>
+      </ng-container>
       <div class="metric"><span>弹性模量 E</span>
         <b>{{ result.elastic_fit.modulus_in_output_unit | number:'1.4-4' }}
           {{ result.elastic_fit.modulus_unit }}</b></div>
