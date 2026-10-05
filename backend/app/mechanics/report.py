@@ -22,6 +22,16 @@ def render_markdown(result: AnalysisResult, specimen_code: str,
     lines.append(f"- 应变来源：**{prov['strain_source']}**（{prov['strain_basis']}）")
     lines.append(f"- 初始截面积 A0 = {prov['initial_area_m2']:.6e} m²")
     lines.append(f"- 应力输出单位：{result.stress_unit}")
+    comp = result.compliance_correction
+    if comp.enabled:
+        lines.append(
+            f"- 机器柔度修正：**已应用**，C = {comp.coefficient:.6g} {comp.unit}"
+            f"（= {comp.coefficient_m_per_n:.6g} m/N）"
+        )
+        lines.append(f"- 修正规则：{comp.machine_displacement_rule}")
+        lines.append("- 原始夹具/引伸计通道未回写；修正曲线为独立派生曲线，用于本次拟合与屈服计算")
+    else:
+        lines.append("- 机器柔度修正：未启用，本次拟合、屈服和断裂指标均基于未修正通道")
     lines.append("")
 
     lines.append("## 1. 弹性模量 E")

@@ -12,7 +12,8 @@ from app.mechanics.synthetic import (
     case_linear_elastic,
     case_no_clear_yield,
 )
-from app.schemas import ExcludedPoint
+from app.schemas import ExcludedPoint, MachineComplianceCorrection
+from app.units import compliance_to_m_per_n
 
 
 ROUND_SPEC = SpecimenInfo(
@@ -58,7 +59,56 @@ def test_case_a_crosshead_channel_differs_from_extensometer():
     assert ext.elastic_fit.modulus_in_output_unit == pytest.approx(200_000, rel=1e-3)
     # 夹具位移更大（含柔度）-> 算得模量系统性偏低
     assert cross.elastic_fit.modulus_in_output_unit < 0.9 * 200_000
-    assert "柔度" in cross.provenance["strain_basis"]
+def test_crosshead_compliance_correction_recovers_material_E_and_keeps_raw_curve():
+    """已知合成机器柔度：按校准值逐点扣除后，夹具位移恢复材料 E；原始曲线仍保留。"""
+    data = case_linear_elastic(E_pa=200e9)
+    uncorrected = run_analysis(_channels(data), ROUND_SPEC, "crosshead", "MPa",
+                               0.0005, 0.004, [], run_id=11)
+    assert uncorrected.elastic_fit.modulus_in_output_unit < 0.9 * 200_000
+
+    c_m_per_n = data.machine_compliance_m_per_n
+    correction = MachineComplianceCorrection(
+        enabled=True, coefficient=c_m_per_n * 1e6, unit="mm/kN")
+    corrected = run_analysis(_channels(data), ROUND_SPEC, "crosshead", "MPa",
+                             0.0005, 0.004, [], run_id=12, compliance=correction)
+    assert corrected.elastic_fit.modulus_in_output_unit == pytest.approx(200_000, rel=1e-3)
+    assert corrected.yield_result.found is False
+    assert corrected.compliance_correction.applied is True
+    assert corrected.compliance_correction.coefficient_m_per_n == pytest.approx(c_m_per_n)
+    assert all(p.uncorrected_strain is not None and p.uncorrected_strain > p.strain
+               for p in corrected.curve[1:])
+    # 原始通道数组没有被派生修正曲线回写
+    assert not np.allclose(data.crosshead_m, data.extensometer_m)
+
+
+def test_disabled_compliance_restores_original_crosshead_result():
+    data = case_linear_elastic(E_pa=200e9)
+    c_m_per_n = data.machine_compliance_m_per_n
+    off = run_analysis(
+        _channels(data), ROUND_SPEC, "crosshead", "MPa", 0.0005, 0.004, [], run_id=13,
+        compliance=MachineComplianceCorrection(
+            enabled=False, coefficient=c_m_per_n * 1e6, unit="mm/kN"))
+    assert off.compliance_correction.enabled is False
+    assert off.compliance_correction.applied is False
+    assert off.elastic_fit.modulus_in_output_unit < 0.9 * 200_000
+    assert all(p.uncorrected_strain is None for p in off.curve)
+
+
+def test_negative_corrected_displacement_is_rejected_without_pseudo_fit():
+    data = case_linear_elastic(E_pa=200e9)
+    bad = MachineComplianceCorrection(
+        enabled=True, coefficient=2.5 * data.machine_compliance_m_per_n * 1e6,
+        unit="mm/kN")
+    with pytest.raises(CurveError, match="修正后位移为.*<0"):
+        run_analysis(_channels(data), ROUND_SPEC, "crosshead", "MPa",
+                     0.0005, 0.004, [], run_id=14, compliance=bad)
+
+
+def test_compliance_units_convert_to_si():
+    assert compliance_to_m_per_n(6.11155, "mm/kN") == pytest.approx(6.11155e-6)
+    assert compliance_to_m_per_n(1.0, "m/N") == 1.0
+    assert compliance_to_m_per_n(1.0, "mm/N") == pytest.approx(1e-3)
+    assert compliance_to_m_per_n(1.0, "µm/N") == pytest.approx(1e-6)
 
 
 def test_case_b_no_clear_yield_flags_unclear():

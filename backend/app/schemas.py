@@ -4,7 +4,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---- 试样与试验 ----
@@ -79,6 +79,31 @@ class ExcludedPoint(BaseModel):
     reason: str = Field(..., min_length=1, description="人工排除原因，不允许空")
 
 
+class MachineComplianceCorrection(BaseModel):
+    """可选机器柔度校准；仅可用于夹具位移通道。"""
+    enabled: bool = True
+    coefficient: float | None = Field(default=None, gt=0)
+    unit: str | None = Field(default=None, description="柔度单位：m/N、mm/N、mm/kN、µm/N")
+
+    @model_validator(mode="after")
+    def validate_calibration(self) -> "MachineComplianceCorrection":
+        if not self.enabled:
+            return self
+        if self.coefficient is None:
+            raise ValueError("已启用机器柔度修正，但缺少柔度系数；请输入校准值或关闭修正")
+        if not self.unit:
+            raise ValueError("已启用机器柔度修正，但缺少校准单位；支持 m/N、mm/N、mm/kN、µm/N")
+        # 不支持的单位提前以业务错误返回，避免量纲错误的“伪修正”
+        from .units import ComplianceUnit
+        try:
+            ComplianceUnit(self.unit)
+        except ValueError as exc:
+            raise ValueError(
+                f"不支持的机器柔度单位 {self.unit!r}；支持 m/N、mm/N、mm/kN、µm/N"
+            ) from exc
+        return self
+
+
 class FitRequest(BaseModel):
     run_id: int
     strain_source: Literal["extensometer", "crosshead"] | None = None
@@ -87,6 +112,19 @@ class FitRequest(BaseModel):
     strain_min: float | None = None
     strain_max: float | None = None
     excluded_points: list[ExcludedPoint] = Field(default_factory=list)
+    machine_compliance: MachineComplianceCorrection | None = None
+
+
+class ComplianceCorrectionResult(BaseModel):
+    enabled: bool
+    applied: bool
+    coefficient: float | None = None
+    unit: str | None = None
+    coefficient_m_per_n: float | None = None
+    machine_displacement_rule: str | None = None
+    n_nonphysical: int = 0
+    nonphysical_indices: list[int] = Field(default_factory=list)
+    nonphysical_reasons: dict[str, str] = Field(default_factory=dict)
 
 
 class ResidualPoint(BaseModel):
@@ -153,6 +191,11 @@ class CurvePoint(BaseModel):
     true_stress_valid: bool
     load_n: float
     source: str
+    uncorrected_strain: float | None = Field(
+        default=None,
+        description="夹具位移修正前的应变；无机器柔度修正或引伸计来源时为 null")
+    physically_valid: bool = True
+    nonphysical_reason: str | None = None
 
 
 class AnalysisResult(BaseModel):
@@ -163,6 +206,7 @@ class AnalysisResult(BaseModel):
     interval_sensitivity: list[IntervalSensitivity]
     yield_result: YieldResult
     fracture: FractureResult
+    compliance_correction: ComplianceCorrectionResult
     curve: list[CurvePoint]
     necking_index: int | None
     warnings: list[str]

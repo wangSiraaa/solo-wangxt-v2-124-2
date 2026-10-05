@@ -7,7 +7,7 @@ import Plotly from 'plotly.js-dist-min';
 
 import { ApiService } from '../api.service';
 import {
-  AnalysisResult, ExcludedPoint, FitRequest, Report, RunDetail,
+  AnalysisResult, ExcludedPoint, FitRequest, MachineComplianceCorrection, Report, RunDetail,
 } from '../models';
 
 type DemoCase = 'linear_elastic' | 'no_clear_yield' | 'clear_yield';
@@ -31,6 +31,11 @@ export class CurveViewerComponent implements AfterViewInit, OnDestroy {
 
   strainSource: 'extensometer' | 'crosshead' = 'extensometer';
   stressUnit = 'MPa';
+  complianceEnabled = false;
+  complianceCoefficient: number | null = 6.11155;
+  complianceUnit = 'mm/kN';
+  compliancePreviewInvalid = false;
+  compliancePreviewReason = '';
   strainMin: number | null = null;
   strainMax: number | null = null;
   excluded: ExcludedPoint[] = [];
@@ -95,11 +100,14 @@ export class CurveViewerComponent implements AfterViewInit, OnDestroy {
           this.stressUnit = run.calc_plan.stress_unit;
           this.strainMin = null;
           this.strainMax = null;
+          this.complianceEnabled = false;
+          this.complianceCoefficient = 6.11155;
+          this.complianceUnit = 'mm/kN';
           this.loading = false;
           this.drawRawCurve();
         });
       },
-      error: (e) => { this.error = e.message; this.loading = false; },
+      error: (e) => { this.error = this.formatHttpError(e); this.loading = false; },
     });
   }
 
@@ -129,6 +137,95 @@ export class CurveViewerComponent implements AfterViewInit, OnDestroy {
     this.drawRawCurve();
   }
 
+  onStrainSourceChange(): void {
+    if (this.strainSource === 'extensometer') {
+      this.complianceEnabled = false;
+    }
+    this.drawRawCurve();
+  }
+
+  onComplianceChange(): void {
+    this.drawRawCurve();
+  }
+
+  private compliancePayload(): MachineComplianceCorrection | null {
+    if (!this.complianceEnabled || this.strainSource !== 'crosshead') {
+      return null;
+    }
+    return {
+      enabled: true,
+      coefficient: this.complianceCoefficient,
+      unit: this.complianceUnit,
+    };
+  }
+
+  private validateComplianceForRequest(): string {
+    if (!this.complianceEnabled || this.strainSource !== 'crosshead') {
+      return '';
+    }
+    if (this.complianceCoefficient === null || Number.isNaN(this.complianceCoefficient)) {
+      return '已启用机器柔度修正，但缺少柔度系数；请输入校准值或关闭修正';
+    }
+    if (this.complianceCoefficient <= 0) {
+      return '机器柔度系数必须大于 0';
+    }
+    if (!this.complianceUnit) {
+      return '已启用机器柔度修正，但缺少校准单位；请选择 m/N、mm/N、mm/kN 或 µm/N';
+    }
+    return '';
+  }
+
+  private complianceMPerN(): number {
+    const factors: Record<string, number> = {
+      'm/N': 1, 'mm/N': 1e-3, 'mm/kN': 1e-6, 'µm/N': 1e-6,
+    };
+    return Number(this.complianceCoefficient ?? 0) * (factors[this.complianceUnit] ?? 0);
+  }
+
+  private checkCorrectedPreview(): { valid: boolean; reason: string } {
+    if (!this.run || !this.complianceEnabled || this.strainSource !== 'crosshead') {
+      return { valid: true, reason: '' };
+    }
+    const rawDisp = this.run.raw_values['crosshead_displacement'];
+    const rawLoad = this.run.raw_values['load'];
+    const dispUnit = this.run.channels.find((c) => c.kind === 'crosshead_displacement')?.unit ?? 'm';
+    const loadUnit = this.run.channels.find((c) => c.kind === 'load')?.unit ?? 'N';
+    if (!rawDisp || !rawLoad || !rawDisp.length) {
+      return { valid: false, reason: '缺少夹具位移通道，无法进行柔度修正预览' };
+    }
+    const dispFactor = dispUnit === 'mm' ? 1e-3 : 1;
+    const loadFactor = loadUnit === 'kN' ? 1e3 : 1;
+    const c = this.complianceMPerN();
+    if (!c || this.complianceCoefficient === null || this.complianceCoefficient <= 0) {
+      return { valid: false, reason: this.validateComplianceForRequest() || '柔度系数无效' };
+    }
+    const firstDisp = rawDisp[0] * dispFactor;
+    const firstLoad = rawLoad[0] * loadFactor;
+    const tolerance = 1e-12 * Math.max(...rawDisp.map((v) => Math.abs(v * dispFactor)));
+    for (let i = 0; i < rawDisp.length; i++) {
+      const deltaDisp = rawDisp[i] * dispFactor - firstDisp;
+      const deltaLoad = rawLoad[i] * loadFactor - firstLoad;
+      const corrected = deltaDisp - c * deltaLoad;
+      if (corrected < -tolerance) {
+        return {
+          valid: false,
+          reason: `第 ${i} 点修正后位移为 ${corrected.toExponential(3)} m（<0）：柔度过大或单位错误，已阻止提交`,
+        };
+      }
+      if (i > 0) {
+        const prevDisp = rawDisp[i - 1] * dispFactor - firstDisp;
+        const prevLoad = rawLoad[i - 1] * loadFactor - firstLoad;
+        if (deltaLoad - prevLoad > 0 && corrected - (prevDisp - c * prevLoad) < -tolerance) {
+          return {
+            valid: false,
+            reason: `第 ${i} 点载荷增加但修正后位移减少，校准值或单位可能错误，已阻止提交`,
+          };
+        }
+      }
+    }
+    return { valid: true, reason: '' };
+  }
+
   private buildRequest(): FitRequest {
     return {
       run_id: this.run!.run_id,
@@ -137,10 +234,29 @@ export class CurveViewerComponent implements AfterViewInit, OnDestroy {
       strain_min: this.strainMin,
       strain_max: this.strainMax,
       excluded_points: this.excluded,
+      machine_compliance: this.compliancePayload(),
     };
   }
 
+  private formatHttpError(e: { error?: unknown }): string {
+    const err = e.error;
+    if (typeof err === 'object' && err !== null) {
+      const detail = (err as { detail?: unknown }).detail;
+      if (typeof detail === 'string') { return detail; }
+      if (Array.isArray(detail)) {
+        return detail.map((d) =>
+          (d as { msg?: string }).msg ?? JSON.stringify(d)).join('；');
+      }
+    }
+    return JSON.stringify(err ?? '请求失败');
+  }
+
   analyze(): void {
+    const complianceError = this.validateComplianceForRequest();
+    if (complianceError) {
+      this.error = complianceError;
+      return;
+    }
     this.error = '';
     this.loading = true;
     this.report = null;
@@ -152,21 +268,24 @@ export class CurveViewerComponent implements AfterViewInit, OnDestroy {
       },
       error: (e) => {
         this.loading = false;
-        this.error = typeof e.error?.detail === 'string'
-          ? e.error.detail : JSON.stringify(e.error);
+        this.error = this.formatHttpError(e);
       },
     });
   }
 
   generateReport(): void {
     if (!this.run) { return; }
+    const complianceError = this.validateComplianceForRequest();
+    if (complianceError) {
+      this.error = complianceError;
+      return;
+    }
     this.loading = true;
     this.api.report(this.run.run_id, this.buildRequest()).subscribe({
       next: (r) => { this.report = r; this.loading = false; },
       error: (e) => {
         this.loading = false;
-        this.error = typeof e.error?.detail === 'string'
-          ? e.error.detail : JSON.stringify(e.error);
+        this.error = this.formatHttpError(e);
       },
     });
   }
@@ -176,24 +295,55 @@ export class CurveViewerComponent implements AfterViewInit, OnDestroy {
   private drawRawCurve(): void {
     if (!this.run) { return; }
     const raw = this.run.raw_values;
-    const le = Number(this.run.equipment['extensometer_gauge_length_mm'] ?? 50) * 1e-3;
-    // 前端预览不做面积换算，仅显示载荷-位移两个独立通道，避免任何混用暗示
-    Plotly.react(this.plotEl.nativeElement, [
-      {
-        x: (raw['extensometer_displacement'] ?? raw['crosshead_displacement']),
-        y: raw['load'],
-        mode: 'lines', name: '载荷-位移（原始通道，单位见元数据）',
-        line: { color: '#2563eb' },
-      },
-    ], {
-      title: '原始信号预览：载荷 vs 位移（通道分列）',
-      xaxis: { title: '位移 (m，原始 SI 值)' },
-      yaxis: { title: '载荷 (N)' },
+    const sourceKind = this.strainSource === 'extensometer'
+      ? 'extensometer_displacement'
+      : 'crosshead_displacement';
+    const rawDisp = raw[sourceKind] ?? raw['extensometer_displacement'] ?? raw['crosshead_displacement'];
+    const rawLoad = raw['load'];
+    if (!rawDisp || !rawDisp.length || !rawLoad || !rawLoad.length) { return; }
+    const channelUnit = this.run.channels.find((c) => c.kind === sourceKind)?.unit ?? 'm';
+    const loadUnit = this.run.channels.find((c) => c.kind === 'load')?.unit ?? 'N';
+    const dispFactor = channelUnit === 'mm' ? 1e-3 : 1;
+    const loadFactor = loadUnit === 'kN' ? 1e3 : 1;
+    const firstDisp = rawDisp[0] * dispFactor;
+    const firstLoad = rawLoad[0] * loadFactor;
+    const originalX = rawDisp.map((v) => v * dispFactor - firstDisp);
+    const originalY = rawLoad.map((v) => v * loadFactor);
+
+    const traces: Record<string, unknown>[] = [{
+      x: originalX,
+      y: originalY,
+      mode: 'lines',
+      name: sourceKind === 'crosshead_displacement'
+        ? '原始夹具位移（未改变）'
+        : '原始引伸计位移（未改变）',
+      line: { color: '#64748b', dash: 'dash' },
+    }];
+
+    const preview = this.checkCorrectedPreview();
+    this.compliancePreviewInvalid = !preview.valid;
+    this.compliancePreviewReason = preview.reason;
+    if (this.complianceEnabled && this.strainSource === 'crosshead') {
+      const c = this.complianceMPerN();
+      const corrected = rawDisp.map((d, i) =>
+        d * dispFactor - firstDisp - c * (rawLoad[i] * loadFactor - firstLoad));
+      traces.push({
+        x: corrected,
+        y: originalY,
+        mode: 'lines',
+        name: `修正夹具位移（C=${this.complianceCoefficient} ${this.complianceUnit}）`,
+        line: { color: preview.valid ? '#2563eb' : '#dc2626' },
+      });
+    }
+
+    Plotly.react(this.plotEl.nativeElement, traces, {
+      title: '原始信号与可选机器柔度修正预览（通道分列，原始数据不回写）',
+      xaxis: { title: '相对位移 (m)' },
+      yaxis: { title: `载荷 (${loadUnit})` },
       dragmode: 'select',
       selectdirection: 'h',
       shapes: [],
     }, { responsive: true, displaylogo: false });
-    void le;
   }
 
   private drawResult(r: AnalysisResult): void {
@@ -246,16 +396,31 @@ export class CurveViewerComponent implements AfterViewInit, OnDestroy {
       });
     }
 
-    Plotly.react(this.plotEl.nativeElement, [
-      { x: engX, y: engY, mode: 'lines', name: '工程应力-应变',
+    const activeName = r.compliance_correction.applied ? '修正后工程应力-应变（参与拟合）' : '工程应力-应变';
+    const traces: Record<string, unknown>[] = [
+      { x: engX, y: engY, mode: 'lines', name: activeName,
         line: { color: '#2563eb' } },
+    ];
+    if (r.compliance_correction.applied) {
+      traces.push({
+        x: pts.map((p) => p.uncorrected_strain),
+        y: pts.map((p) => p.engineering_stress),
+        mode: 'lines', name: '原始夹具位移应变（仅对比，不参与拟合）',
+        line: { color: '#94a3b8', dash: 'dash' },
+      });
+    }
+    traces.push(
       { x: trueX, y: trueY, mode: 'lines', name: '真实应力（颈缩后不换算）',
         line: { color: '#7c3aed' } },
       { x: exclX, y: exclY, mode: 'markers', name: '人工排除点（有原因）',
         marker: { color: '#dc2626', size: 8, symbol: 'x' } },
       fitLine, offsetLine,
-    ], {
-      title: `应力-应变（应变来源：${r.strain_source_used}）— 红竖线颈缩起点`,
+    );
+
+    Plotly.react(this.plotEl.nativeElement, traces, {
+      title: `应力-应变（应变来源：${r.strain_source_used}${
+        r.compliance_correction.applied ? '，已扣除机器柔度' : ''
+      }）— 红竖线颈缩起点`,
       xaxis: { title: '工程应变 ε (mm/mm)' },
       yaxis: { title: `应力 (${r.stress_unit})` },
       shapes,

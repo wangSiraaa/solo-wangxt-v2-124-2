@@ -127,6 +127,7 @@ def _do_analysis(db: Session, req: FitRequest) -> tuple[Analysis, AnalysisResult
             strain_max=req.strain_max,
             excluded=req.excluded_points,
             run_id=run.id,
+            compliance=req.machine_compliance,
         )
     except CurveError as exc:
         #尺寸缺失、通道缺失、区间点数不足等：明确 422 与原因，不返回伪造数值
@@ -138,6 +139,8 @@ def _do_analysis(db: Session, req: FitRequest) -> tuple[Analysis, AnalysisResult
         "strain_min": req.strain_min,
         "strain_max": req.strain_max,
         "excluded_points": [p.model_dump() for p in req.excluded_points],
+        "machine_compliance": (req.machine_compliance.model_dump(mode="json")
+                               if req.machine_compliance is not None else None),
     }
     analysis = services.persist_analysis(db, run.id, params, result.model_dump(mode="json"))
     return analysis, result

@@ -22,7 +22,7 @@
         通道：<span *ngFor="let c of run.channels"><br>· {{ c.kind }} ({{ c.unit }}, {{ c.point_count }} 点)</span>
       </div>
       <label>应变来源（夹具位移与引伸计不可混列）</label>
-      <select [(ngModel)]="strainSource">
+      <select [(ngModel)]="strainSource" (ngModelChange)="onStrainSourceChange()">
         <option value="extensometer"
           *ngIf="run.raw_values['extensometer_displacement']">引伸计（材料应变，优先）</option>
         <option value="crosshead"
@@ -32,6 +32,43 @@
       <select [(ngModel)]="stressUnit">
         <option>MPa</option><option>GPa</option><option>Pa</option>
       </select>
+
+      <div class="compliance-box">
+        <label style="font-weight:600">
+          <input type="checkbox" [(ngModel)]="complianceEnabled"
+                 [disabled]="strainSource !== 'crosshead'"
+                 (change)="onComplianceChange()"
+                 style="width:auto">
+          扣除机器柔度（仅夹具位移）
+        </label>
+        <div class="muted">逐点计算 δ修正 = 相对夹具位移 − C × 相对载荷；原始信号保持不变。</div>
+        <div class="row2">
+          <div>
+            <label>柔度系数 C</label>
+            <input type="number" step="0.0001" min="0"
+                   [(ngModel)]="complianceCoefficient"
+                   [disabled]="!complianceEnabled || strainSource !== 'crosshead'"
+                   (ngModelChange)="onComplianceChange()">
+          </div>
+          <div>
+            <label>校准单位</label>
+            <select [(ngModel)]="complianceUnit"
+                    [disabled]="!complianceEnabled || strainSource !== 'crosshead'"
+                    (ngModelChange)="onComplianceChange()">
+              <option>mm/kN</option>
+              <option>m/N</option>
+              <option>mm/N</option>
+              <option>µm/N</option>
+            </select>
+          </div>
+        </div>
+        <div class="warn" *ngIf="complianceEnabled && strainSource === 'crosshead' && compliancePreviewInvalid">
+          ⚠ {{ compliancePreviewReason }}
+        </div>
+        <div class="muted" *ngIf="strainSource === 'extensometer'">
+          引伸计直接测量试样标距，不应用机器柔度修正。
+        </div>
+      </div>
 
       <h2 style="margin-top:14px">3. 弹性区间</h2>
       <div class="muted">在右侧图上横向框选弹性段；区间影响随拟合一并给出。</div>
@@ -60,15 +97,26 @@
         </tr>
       </table>
 
-      <button (click)="analyze()" [disabled]="loading || strainMin === null || strainMax === null">
+      <button (click)="analyze()"
+              [disabled]="loading || strainMin === null || strainMax === null || compliancePreviewInvalid">
         SciPy 拟合 / 计算
       </button>
-      <button class="secondary" (click)="generateReport()" [disabled]="loading">生成溯源报告</button>
+      <button class="secondary" (click)="generateReport()"
+              [disabled]="loading || compliancePreviewInvalid">生成溯源报告</button>
       <div class="error" *ngIf="error">{{ error }}</div>
     </div>
 
     <div class="panel" *ngIf="result">
       <h2>计算结果</h2>
+      <div class="metric" *ngIf="result.compliance_correction.enabled">
+        <span>机器柔度校准</span>
+        <b>C = {{ result.compliance_correction.coefficient | number:'1.6-6' }}
+          {{ result.compliance_correction.unit }}</b>
+      </div>
+      <div class="muted" *ngIf="result.compliance_correction.enabled">
+        {{ result.compliance_correction.machine_displacement_rule }}；
+        SI 值 {{ result.compliance_correction.coefficient_m_per_n }} m/N。
+      </div>
       <div class="metric"><span>弹性模量 E</span>
         <b>{{ result.elastic_fit.modulus_in_output_unit | number:'1.4-4' }}
           {{ result.elastic_fit.modulus_unit }}</b></div>

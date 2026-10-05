@@ -3,6 +3,24 @@ export interface ExcludedPoint {
   reason: string;
 }
 
+export interface MachineComplianceCorrection {
+  enabled: boolean;
+  coefficient: number | null;
+  unit: string | null;
+}
+
+export interface ComplianceCorrectionResult {
+  enabled: boolean;
+  applied: boolean;
+  coefficient: number | null;
+  unit: string | null;
+  coefficient_m_per_n: number | null;
+  machine_displacement_rule: string | null;
+  n_nonphysical: number;
+  nonphysical_indices: number[];
+  nonphysical_reasons: Record<string, string>;
+}
+
 export interface FitRequest {
   run_id: number;
   strain_source?: 'extensometer' | 'crosshead';
@@ -10,6 +28,7 @@ export interface FitRequest {
   strain_min: number | null;
   strain_max: number | null;
   excluded_points: ExcludedPoint[];
+  machine_compliance?: MachineComplianceCorrection | null;
 }
 
 export interface FitResult {
@@ -70,6 +89,9 @@ export interface CurvePoint {
   true_stress_valid: boolean;
   load_n: number;
   source: string;
+  uncorrected_strain: number | null;
+  physically_valid: boolean;
+  nonphysical_reason: string | null;
 }
 
 export interface AnalysisResult {
@@ -80,6 +102,7 @@ export interface AnalysisResult {
   interval_sensitivity: IntervalSensitivity[];
   yield_result: YieldResult;
   fracture: FractureResult;
+  compliance_correction: ComplianceCorrectionResult;
   curve: CurvePoint[];
   necking_index: number | null;
   warnings: string[];

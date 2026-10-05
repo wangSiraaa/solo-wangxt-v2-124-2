@@ -1,7 +1,7 @@
 """信号通道 -> 工程/真实 应力应变曲线。
 
 约束（对应需求）：
-* 载荷、夹具位移、引伸计读数各自独立通道，绝不混为一列；
+* 载荷、夹具位移、引伸计读数各自独立通道，绝不混为一列；机器柔度修正仅派生新曲线；
 * 颈缩后真实应力/应变的简单换算失效，直接标记 null/False，不伪造；
 * 所有几何量与标距的选择都进入 provenance，报告可溯源。
 """
@@ -114,38 +114,109 @@ class StressStrainCurve:
     basis_description: str
     area0_m2: float
     basis_m: float
+    uncorrected_strain: np.ndarray | None = None
+    physically_valid: np.ndarray | None = None
+    nonphysical_reasons: dict[int, str] = field(default_factory=dict)
+    compliance_m_per_n: float | None = None
+    compliance_applied: bool = False
     warnings: list[str] = field(default_factory=list)
 
 
 def build_curve(channels: Channels, specimen: SpecimenInfo,
-                strain_source: str) -> StressStrainCurve:
+                strain_source: str,
+                compliance_m_per_n: float | None = None) -> StressStrainCurve:
     area0 = specimen.initial_area_m2()
     basis_m, basis_desc = specimen.strain_basis_m(strain_source)
 
     if strain_source == "extensometer":
         if channels.extensometer_m is None:
             raise CurveError("计算方案选择引伸计应变，但该试验没有引伸计通道")
-        disp = channels.extensometer_m
+        source_disp_all = channels.extensometer_m
     else:
         if channels.crosshead_m is None:
             raise CurveError("计算方案选择夹具位移应变，但该试验没有夹具位移通道")
-        disp = channels.crosshead_m
+        source_disp_all = channels.crosshead_m
 
-    # 以位移首点为应变零点（预载可能非零，力不归零，应力基于绝对力）
-    load = channels.load_n
-    strain = (disp - disp[0]) / basis_m
-    stress = load / area0
+    load_all = channels.load_n
 
-    # 单调化保护：位移回退（卸载段）不参与材料曲线，给出警告并截断到最大应变点之后
+    # 以位移首点为应变零点（预载可能非零，力不归零，应力基于绝对力）。
+    # 先按原始夹具位移判断卸载/回退；机器柔度修正只生成派生信号，绝不回写 raw_signals。
     warnings: list[str] = []
-    peak_disp_idx = int(np.argmax(disp))
-    if peak_disp_idx != len(disp) - 1:
+    raw_peak_disp_idx = int(np.argmax(source_disp_all))
+    if raw_peak_disp_idx != len(source_disp_all) - 1:
         warnings.append(
-            f"检测到位移在第 {peak_disp_idx} 点后回退（卸载或引伸计摘除），"
+            f"检测到原始位移在第 {raw_peak_disp_idx} 点后回退（卸载或引伸计摘除），"
             "材料曲线仅保留单调加载段"
         )
-        strain = strain[: peak_disp_idx + 1]
-        stress = stress[: peak_disp_idx + 1]
+    raw_slice = slice(0, raw_peak_disp_idx + 1)
+    disp_raw_branch = source_disp_all[raw_slice]
+    load_raw_branch = load_all[raw_slice]
+
+    active_disp = disp_raw_branch
+    active_load = load_raw_branch
+    uncorrected_strain: np.ndarray | None = None
+    physically_valid: np.ndarray | None = None
+    nonphysical_reasons: dict[int, str] = {}
+    compliance_applied = False
+
+    if compliance_m_per_n is not None:
+        if strain_source != "crosshead":
+            raise CurveError("机器柔度修正只能用于夹具位移通道，不能用于引伸计信号")
+
+        # 预载/位移零点同时归零：δ_corr = (D-D0) - C(F-F0)
+        disp_change = disp_raw_branch - disp_raw_branch[0]
+        load_change = load_raw_branch - load_raw_branch[0]
+        corrected_disp = disp_change - compliance_m_per_n * load_change
+        scale_tol = 1e-12 * max(float(np.max(np.abs(disp_change))), 1.0)
+        force_tol = 1e-12 * max(float(np.max(np.abs(load_change))), 1.0)
+
+        negative_idx = np.flatnonzero(corrected_disp < -scale_tol)
+        if len(negative_idx):
+            i = int(negative_idx[0])
+            raise CurveError(
+                f"第 {i} 点修正后位移为 {corrected_disp[i]:.6g} m（<0）："
+                "校准柔度过大、载荷/位移单位不匹配或该点不满足单调加载，"
+                "已阻止柔度修正拟合，未保存分析结果"
+            )
+
+        d_disp = np.diff(corrected_disp)
+        d_load = np.diff(load_change)
+        reverse = np.flatnonzero((d_load > force_tol) & (d_disp < -scale_tol))
+        if len(reverse):
+            i = int(reverse[0]) + 1
+            raise CurveError(
+                f"第 {i} 点载荷增加但修正后位移减少："
+                "机器柔度校准值或单位可能错误，已阻止非物理修正曲线参与拟合"
+            )
+
+        active_disp = corrected_disp
+        active_load = load_change + load_raw_branch[0]
+        compliance_applied = True
+        corrected_peak = int(np.argmax(corrected_disp))
+        if corrected_peak != len(corrected_disp) - 1:
+            warnings.append(
+                f"扣除机器柔度后，位移在第 {corrected_peak} 点达到峰值；"
+                "仅使用此前的单调修正段参与材料曲线计算"
+            )
+            active_slice = slice(0, corrected_peak + 1)
+            active_disp = corrected_disp[active_slice]
+            active_load = load_raw_branch[active_slice]
+        else:
+            active_slice = slice(0, len(corrected_disp))
+
+        # 原始夹具应变只作为对比曲线，不改变原始通道，也不参与修正后的拟合。
+        uncorrected_full = disp_change / basis_m
+        uncorrected_strain = uncorrected_full[active_slice]
+        basis_desc = (
+            f"平行段/试样长度近似的夹具位移，已逐点扣除机器变形 "
+            f"F·C（C={compliance_m_per_n:.6g} m/N）"
+        )
+    else:
+        active_slice = slice(0, len(disp_raw_branch))
+
+    strain = (active_disp - active_disp[0]) / basis_m
+    stress = active_load / area0
+    physically_valid = np.ones(len(strain), dtype=bool)
 
     # 颈缩起点 = 最大工程应力（最大载荷）点；之后简单换算失效
     uts_index = int(np.argmax(stress))
@@ -176,5 +247,10 @@ def build_curve(channels: Channels, specimen: SpecimenInfo,
         basis_description=basis_desc,
         area0_m2=area0,
         basis_m=basis_m,
+        uncorrected_strain=uncorrected_strain,
+        physically_valid=physically_valid,
+        nonphysical_reasons=nonphysical_reasons,
+        compliance_m_per_n=compliance_m_per_n if compliance_applied else None,
+        compliance_applied=compliance_applied,
         warnings=warnings,
     )

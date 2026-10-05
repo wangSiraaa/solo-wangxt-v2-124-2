@@ -17,6 +17,7 @@ class SyntheticRun:
     crosshead_m: np.ndarray
     extensometer_m: np.ndarray
     n: int
+    machine_compliance_m_per_n: float = 0.0
 
 
 def _signals_from_strain(strain: np.ndarray, stress_pa: np.ndarray,
@@ -29,9 +30,11 @@ def _signals_from_strain(strain: np.ndarray, stress_pa: np.ndarray,
     """
     load = stress_pa * area_m2
     ext_disp = strain * le_m
-    cross_disp = strain * lc_m + load / (area_m2 * 2e11) * compliance * lc_m
+    machine_compliance_m_per_n = compliance * lc_m / (2e11 * area_m2)
+    cross_disp = strain * lc_m + load * machine_compliance_m_per_n
     return SyntheticRun(load_n=load, crosshead_m=cross_disp,
-                        extensometer_m=ext_disp, n=len(strain))
+                        extensometer_m=ext_disp, n=len(strain),
+                        machine_compliance_m_per_n=machine_compliance_m_per_n)
 
 
 def case_linear_elastic(E_pa: float = 200e9, d0_mm: float = 10.0,
